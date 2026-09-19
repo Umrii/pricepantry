@@ -1,0 +1,72 @@
+name: price-pantry
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: pricepantry-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pricepantry}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pricepantry}
+      POSTGRES_DB: ${POSTGRES_DB:-pricepantry}
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pricepantry} -d ${POSTGRES_DB:-pricepantry}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    container_name: pricepantry-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-pricepantry}:${POSTGRES_PASSWORD:-pricepantry}@db:5432/${POSTGRES_DB:-pricepantry}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    ports:
+      - "8000:8000"
+    # Apply migrations, then start the API. On first boot also seed demo data.
+    command: >
+      sh -c "alembic upgrade head &&
+             python -m app.seed &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Inlined into the client bundle at build time (Next.js requirement).
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    container_name: pricepantry-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      # Browser-facing URL of the backend (host machine, not the compose network).
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+
+  # Run-once utility: `docker compose run --rm scraper`
+  scraper:
+    build:
+      context: ./scrapers
+    container_name: pricepantry-scraper
+    profiles: ["tools"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-pricepantry}:${POSTGRES_PASSWORD:-pricepantry}@db:5432/${POSTGRES_DB:-pricepantry}
+      SCRAPER_MAX_PAGES: ${SCRAPER_MAX_PAGES:-2}
+      SCRAPER_HEADLESS: ${SCRAPER_HEADLESS:-true}
+
+volumes:
+  db_data:
