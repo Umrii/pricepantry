@@ -39,7 +39,9 @@ class Product(Base, TimestampMixin):
     prices: Mapped[list["Price"]] = relationship(  # noqa: F821
         back_populates="product",
         cascade="all, delete-orphan",
-        order_by="Price.scraped_at.desc()",
+        # Newest first, with id as a deterministic tiebreak for identical
+        # timestamps so ``prices[0]`` is always the single latest observation.
+        order_by="Price.scraped_at.desc(), Price.id.desc()",
     )
 
     def __repr__(self) -> str:  # pragma: no cover

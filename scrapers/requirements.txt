@@ -2,3 +2,6 @@ playwright==1.49.0
 beautifulsoup4==4.12.3
 sqlalchemy==2.0.36
 psycopg[binary]==3.2.3
+
+# --- dev / test ---
+pytest==8.3.4

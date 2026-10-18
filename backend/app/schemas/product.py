@@ -1,6 +1,7 @@
 """Product schemas."""
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict
@@ -29,6 +30,9 @@ class ProductRead(ProductBase):
     store: StoreRead
     latest_price: Decimal | None = None
     currency: str | None = None
+    # When the latest valid price was successfully observed (UTC). None when the
+    # product has no valid price observation yet.
+    price_updated_at: datetime | None = None
 
 
 class ProductDetail(ProductRead):

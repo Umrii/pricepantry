@@ -9,6 +9,7 @@ import { Card, Badge } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { PriceTag } from "@/components/PriceTag";
 import { PriceHistoryChart } from "@/components/PriceHistoryChart";
+import { formatObservedAt, freshnessOf } from "@/lib/freshness";
 
 export default function ProductPage({
   params,
@@ -85,15 +86,31 @@ export default function ProductPage({
           </dl>
 
           <div className="mt-2">
-            <PriceTag
-              value={product.latest_price}
-              currency={product.currency}
-              className="text-3xl"
-            />
-            {product.price_history[0]?.unit_price && (
-              <span className="ml-2 text-sm text-gray-500">
-                {product.price_history[0].unit_price}
-              </span>
+            {product.latest_price !== null ? (
+              <>
+                <div className="flex items-baseline gap-2">
+                  <PriceTag
+                    value={product.latest_price}
+                    currency={product.currency}
+                    className="text-3xl"
+                  />
+                  {product.price_history[0]?.unit_price && (
+                    <span className="text-sm text-gray-500">
+                      {product.price_history[0].unit_price}
+                    </span>
+                  )}
+                </div>
+                <PriceFreshness observedAt={product.price_updated_at} />
+              </>
+            ) : (
+              <div>
+                <p className="text-2xl font-semibold text-gray-400">
+                  Price unavailable
+                </p>
+                <p className="mt-1 text-sm text-gray-500">
+                  No valid price has been observed for this product yet.
+                </p>
+              </div>
             )}
           </div>
 
@@ -111,6 +128,27 @@ export default function ProductPage({
         </h2>
         <PriceHistoryChart history={product.price_history} />
       </Card>
+    </div>
+  );
+}
+
+/** "Price last observed" line with a recent/outdated badge. */
+function PriceFreshness({ observedAt }: { observedAt: string | null }) {
+  const when = formatObservedAt(observedAt);
+  if (!when) return null;
+  const stale = freshnessOf(observedAt) === "stale";
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-gray-500">
+      <span>Price last observed: {when}</span>
+      <span
+        className={
+          stale
+            ? "rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700"
+            : "rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700"
+        }
+      >
+        {stale ? "May be outdated" : "Recent"}
+      </span>
     </div>
   );
 }

@@ -19,6 +19,8 @@ export interface Product {
   store: Store;
   latest_price: string | null;
   currency: string | null;
+  /** When the latest valid price was observed (UTC ISO), or null if none. */
+  price_updated_at: string | null;
 }
 
 export interface Price {

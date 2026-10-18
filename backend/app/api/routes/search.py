@@ -20,6 +20,4 @@ def search(
     page_size: int = Query(20, ge=1, le=100),
 ) -> Page[ProductRead]:
     items, total = crud.search_products(db, q=q, page=page, page_size=page_size)
-    return Page.create(
-        [crud.to_read(p) for p in items], total=total, page=page, page_size=page_size
-    )
+    return Page.create(items, total=total, page=page, page_size=page_size)

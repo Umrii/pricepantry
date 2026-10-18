@@ -117,16 +117,47 @@ def get_or_create_store(db: Session, slug: str, name: str, website_url: str) -> 
     return store
 
 
-def persist(db: Session, store: Store, items: list[ScrapedProduct]) -> tuple[int, int]:
-    """Upsert products (by URL) and insert a fresh price row for each.
+@dataclass
+class PersistSummary:
+    """Counts for one persistence pass, for scraper diagnostics."""
 
-    Returns (new_products, price_rows_inserted).
+    attempted: int = 0   # scraped products handed to persist()
+    created: int = 0     # new product rows
+    matched: int = 0     # existing product rows updated
+    persisted: int = 0   # price observations inserted (successful)
+    skipped: int = 0     # products with no valid price → no observation
+
+    def as_line(self) -> str:
+        return (
+            f"attempted={self.attempted} created={self.created} "
+            f"matched={self.matched} persisted={self.persisted} "
+            f"skipped={self.skipped}"
+        )
+
+
+def is_valid_price(price: Decimal | None) -> bool:
+    """A price is only valid (storable) when it is a positive amount.
+
+    Guards against a failed extraction (``None``) or a bogus ``£0.00`` becoming
+    a misleading price observation.
     """
-    new_products = 0
-    price_rows = 0
+    return price is not None and price > 0
+
+
+def persist(db: Session, store: Store, items: list[ScrapedProduct]) -> PersistSummary:
+    """Upsert products and append a fresh price observation for each valid one.
+
+    Products are matched on the store-native ``external_id`` first (stable
+    across URL format changes), then on URL. Every scrape appends a new price
+    row — history is never overwritten. A product with no valid price is still
+    upserted (metadata), but no price observation is created.
+
+    Logs one diagnostic line per product and returns a :class:`PersistSummary`.
+    Extraction failures (no valid price) are logged as skips; a database error
+    during commit is logged distinctly and re-raised.
+    """
+    summary = PersistSummary(attempted=len(items))
     for item in items:
-        # Prefer matching on the store-native external_id (stable across URL
-        # format changes, e.g. /groceries/ vs /shop/); fall back to URL.
         product = None
         if item.external_id:
             product = db.scalar(
@@ -141,6 +172,7 @@ def persist(db: Session, store: Store, items: list[ScrapedProduct]) -> tuple[int
                     Product.store_id == store.id, Product.url == item.url
                 )
             )
+
         if product is None:
             product = Product(
                 store_id=store.id,
@@ -154,7 +186,8 @@ def persist(db: Session, store: Store, items: list[ScrapedProduct]) -> tuple[int
             )
             db.add(product)
             db.flush()
-            new_products += 1
+            summary.created += 1
+            disposition = "created"
         else:
             # Refresh mutable metadata that may have changed.
             product.name = item.name or product.name
@@ -163,8 +196,11 @@ def persist(db: Session, store: Store, items: list[ScrapedProduct]) -> tuple[int
             product.category = item.category or product.category
             product.image_url = item.image_url or product.image_url
             product.url = item.url or product.url
+            summary.matched += 1
+            disposition = "matched"
 
-        if item.price is not None:
+        ref = item.external_id or item.url
+        if is_valid_price(item.price):
             db.add(
                 Price(
                     product_id=product.id,
@@ -174,7 +210,23 @@ def persist(db: Session, store: Store, items: list[ScrapedProduct]) -> tuple[int
                     in_stock=item.in_stock,
                 )
             )
-            price_rows += 1
+            summary.persisted += 1
+            print(
+                f"[persist] {store.slug} {ref} {disposition} "
+                f"price={item.price} -> observation persisted"
+            )
+        else:
+            summary.skipped += 1
+            reason = "no price extracted" if item.price is None else "non-positive price"
+            print(
+                f"[persist] {store.slug} {ref} {disposition} "
+                f"-> skipped observation ({reason})"
+            )
 
-    db.commit()
-    return new_products, price_rows
+    try:
+        db.commit()
+    except Exception as exc:  # pragma: no cover - defensive, exercised in tests
+        db.rollback()
+        print(f"[persist] DB ERROR committing {store.slug} batch: {exc!r}")
+        raise
+    return summary

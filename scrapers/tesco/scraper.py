@@ -29,6 +29,54 @@ SEARCH_URL = "https://www.tesco.com/groceries/en-GB/search?query={query}&page={p
 PRODUCT_HREF_RE = re.compile(r"/products/(\d+)")
 PRICE_RE = re.compile(r"£\s?(\d+(?:\.\d{1,2})?)")
 UNIT_PRICE_RE = re.compile(r"£\s?\d+(?:\.\d{1,2})?\s*/\s*\w+")
+# A tile node whose text is *only* a price, e.g. "£2.75". The real sell price
+# usually sits in its own element, while promo/unit figures are embedded in
+# longer text ("Any 2 for £4.00", "£1.38/litre").
+LONE_PRICE_RE = re.compile(r"^£\s?\d+(?:\.\d{1,2})?$")
+# A £ amount is a unit price when it is immediately FOLLOWED by "/unit" or "per".
+_UNIT_AFTER_RE = re.compile(r"\s*(?:/|per\b)", re.IGNORECASE)
+# Promotional / multi-buy wording that, when it PRECEDES a £ amount, marks that
+# amount as not the product's own sell price (e.g. "Any 2 for £4", "Was £3",
+# "Save £1", "3 for £5", Clubcard offers, "Spend £40 for free delivery").
+_PROMO_CTX_RE = re.compile(
+    r"(?:any\s*\d+|\d+\s*for\b|\bfor\s*£|\bsave\b|\bwas\b|clubcard|\boffer|"
+    r"multi-?buy|mix\b|meal\s*deal|when\s+you\b|\bspend\b)",
+    re.IGNORECASE,
+)
+# Container class names that denote a promotional price block.
+_PROMO_CLASS_RE = re.compile(r"offer|promo|promotion|clubcard|multi-?buy", re.IGNORECASE)
+
+
+def extract_price(text: str) -> Decimal | None:
+    """Return a product's own sell price from a blob of tile/price text.
+
+    Tesco tiles concatenate several monetary values — the sell price, a unit
+    price ("£1.38/litre") and sometimes promotional / multi-buy amounts
+    ("Any 2 for £4.00"). Taking the first "£" blindly (the original bug) could
+    return a promo or unit figure instead of the real price.
+
+    Scan amounts left to right and return the first that is neither a unit
+    price (judged by the text right after it) nor introduced by a promotional
+    phrase (judged by the text since the previous amount, so promo context does
+    not bleed onto the following value). Used as the fallback when a dedicated
+    price element cannot be isolated (see ``TescoScraper._extract_price``).
+    """
+    if not text:
+        return None
+    prev_end = 0
+    for m in PRICE_RE.finditer(text):
+        start, end = m.span()
+        context = text[prev_end:start]
+        prev_end = end
+        if _UNIT_AFTER_RE.match(text[end:end + 8]):
+            continue  # unit price, e.g. "£1.38/litre"
+        if _PROMO_CTX_RE.search(context):
+            continue  # promotional / multi-buy amount
+        try:
+            return Decimal(m.group(1))
+        except InvalidOperation:
+            continue
+    return None
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -84,14 +132,9 @@ class TescoScraper(AbstractScraper):
         return self.categories
 
     def scrape_price(self, raw: dict) -> Decimal | None:
-        text = raw.get("price_text", "")
-        match = PRICE_RE.search(text)
-        if not match:
-            return None
-        try:
-            return Decimal(match.group(1))
-        except InvalidOperation:
-            return None
+        # AbstractScraper interface: parse a price from raw text, skipping unit
+        # and promotional amounts.
+        return extract_price(raw.get("price_text", ""))
 
     def scrape_products(self, category: str) -> list[ScrapedProduct]:
         assert self._page is not None, "scrape_products must run inside run()"
@@ -180,7 +223,7 @@ class TescoScraper(AbstractScraper):
                 continue
 
             tile_text = tile.get_text(" ", strip=True)
-            price = self.scrape_price({"price_text": tile_text})
+            price = self._extract_price(tile)
             unit_match = UNIT_PRICE_RE.search(tile_text)
             img = tile.select_one("img")
             image_url = img.get("src") or img.get("data-src") if img else None
@@ -199,6 +242,50 @@ class TescoScraper(AbstractScraper):
                 )
             )
         return results
+
+    def _extract_price(self, tile) -> Decimal | None:
+        """Extract the product's own sell price from a search-result tile.
+
+        Prefer a dedicated element that contains *only* a price (a node whose
+        text is exactly "£2.75") and is not inside a promotional block; this
+        sidesteps multi-buy / Clubcard / unit figures elsewhere in the tile
+        (the root cause of the £4.00-vs-£2.75 discrepancy). Fall back to a
+        promo/unit-aware scan of the whole tile text when no such node exists.
+        """
+        for el in tile.find_all(True):
+            text = el.get_text(" ", strip=True)
+            if not LONE_PRICE_RE.match(text):
+                continue
+            if self._in_promo_context(el, tile):
+                continue
+            amount = extract_price(text)
+            if amount is not None:
+                return amount
+        return extract_price(tile.get_text(" ", strip=True))
+
+    @staticmethod
+    def _in_promo_context(el, tile) -> bool:
+        """True if ``el`` sits inside a promotional / multi-buy price block.
+
+        Judged by (a) a promo-ish class on any ancestor up to the tile, and
+        (b) a promo phrase in the price's *immediate sub-container* — but never
+        the tile root itself, whose text always includes the promo banner.
+        """
+        node = el
+        for _ in range(5):
+            if node is None or not hasattr(node, "get"):
+                break
+            classes = " ".join(node.get("class", []) or [])
+            if classes and _PROMO_CLASS_RE.search(classes):
+                return True
+            if node is tile:
+                break
+            node = node.parent
+        parent = el.parent
+        if parent is not None and parent is not tile and hasattr(parent, "get_text"):
+            if _PROMO_CTX_RE.search(parent.get_text(" ", strip=True)):
+                return True
+        return False
 
     @staticmethod
     def _extract_name(tile, link) -> str | None:

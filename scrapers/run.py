@@ -56,8 +56,8 @@ def main() -> int:
         store = get_or_create_store(
             db, scraper.slug, scraper.store_name, scraper.website_url
         )
-        new_products, price_rows = persist(db, store, products)
-        print(f"[run] persisted: {new_products} new products, {price_rows} price rows")
+        summary = persist(db, store, products)
+        print(f"[run] persisted summary: {summary.as_line()}")
     finally:
         db.close()
     return 0
