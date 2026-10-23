@@ -35,8 +35,16 @@ class Price(Base):
     unit_price: Mapped[str | None] = mapped_column(String(100), nullable=True)
     in_stock: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
+    # When this price was *first* observed (i.e. when it changed to this value).
     scraped_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True, nullable=False
+    )
+    # When this same price was *most recently* re-observed. Idempotent ingestion
+    # bumps this instead of inserting a duplicate row for an unchanged price, so
+    # history records genuine price changes while freshness reflects the last
+    # successful confirmation.
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

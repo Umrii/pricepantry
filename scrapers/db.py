@@ -97,6 +97,9 @@ class Price(Base):
     scraped_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -138,14 +141,15 @@ class PersistSummary:
     attempted: int = 0   # scraped products handed to persist()
     created: int = 0     # new product rows
     matched: int = 0     # existing product rows updated
-    persisted: int = 0   # price observations inserted (successful)
+    persisted: int = 0   # NEW price observations inserted (price changed/new)
+    unchanged: int = 0   # unchanged price re-confirmed (last_seen_at bumped)
     skipped: int = 0     # products with no valid price → no observation
 
     def as_line(self) -> str:
         return (
             f"attempted={self.attempted} created={self.created} "
             f"matched={self.matched} persisted={self.persisted} "
-            f"skipped={self.skipped}"
+            f"unchanged={self.unchanged} skipped={self.skipped}"
         )
 
 
@@ -264,20 +268,45 @@ def persist(db: Session, store: Store, items: list[ScrapedProduct]) -> PersistSu
             disposition = "matched"
 
         if is_valid_price(item.price):
-            db.add(
-                Price(
-                    product_id=product.id,
-                    price=item.price,
-                    currency="GBP",
-                    unit_price=item.unit_price,
-                    in_stock=item.in_stock,
+            latest = db.scalar(
+                select(Price)
+                .where(Price.product_id == product.id)
+                .order_by(Price.scraped_at.desc(), Price.id.desc())
+                .limit(1)
+            )
+            unchanged = (
+                latest is not None
+                and latest.price == item.price
+                and latest.currency == "GBP"
+                and latest.in_stock == item.in_stock
+            )
+            if unchanged:
+                # Idempotent: the price has not changed since the last
+                # observation, so re-confirm it (bump last_seen_at) instead of
+                # inserting a duplicate row. Reruns therefore do not stack rows.
+                latest.last_seen_at = func.now()
+                if item.unit_price:
+                    latest.unit_price = item.unit_price
+                summary.unchanged += 1
+                print(
+                    f"[persist] {store.slug} {ref} {disposition} "
+                    f"price={item.price} -> unchanged (re-confirmed)"
                 )
-            )
-            summary.persisted += 1
-            print(
-                f"[persist] {store.slug} {ref} {disposition} "
-                f"price={item.price} -> observation persisted"
-            )
+            else:
+                db.add(
+                    Price(
+                        product_id=product.id,
+                        price=item.price,
+                        currency="GBP",
+                        unit_price=item.unit_price,
+                        in_stock=item.in_stock,
+                    )
+                )
+                summary.persisted += 1
+                print(
+                    f"[persist] {store.slug} {ref} {disposition} "
+                    f"price={item.price} -> observation persisted"
+                )
         else:
             summary.skipped += 1
             reason = "no price extracted" if item.price is None else "non-positive price"

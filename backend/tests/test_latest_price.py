@@ -59,10 +59,14 @@ def _product(db: Session, store: Store, name: str, ext: str) -> Product:
     return p
 
 
-def _price(db: Session, product: Product, amount: str, scraped_at: datetime) -> Price:
+def _price(
+    db: Session, product: Product, amount: str, scraped_at: datetime,
+    last_seen_at: datetime | None = None,
+) -> Price:
     pr = Price(
         product_id=product.id, price=Decimal(amount), currency="GBP",
         in_stock=True, scraped_at=scraped_at,
+        last_seen_at=last_seen_at or scraped_at,
     )
     db.add(pr)
     db.flush()
@@ -86,6 +90,23 @@ def test_latest_is_most_recent_even_when_inserted_out_of_order(db_client):
     assert body["price_updated_at"].startswith("2026-10-18T12:00:00")
     # History newest-first, all three observations, chronologically consistent.
     assert [h["price"] for h in body["price_history"]] == ["2.00", "1.90", "1.80"]
+
+
+def test_price_updated_at_reflects_last_seen_not_change_time(db_client):
+    # An unchanged price re-confirmed later: price_updated_at should be the
+    # last_seen_at (last confirmation), not scraped_at (when it first changed).
+    TestingSession, client = db_client
+    db = TestingSession()
+    store = _store(db)
+    p = _product(db, store, "Milk 2L", "150")
+    _price(db, p, "1.80", T0, last_seen_at=T0 + timedelta(hours=6))
+    db.commit()
+    db.close()
+
+    body = client.get(f"/products/{p.id}").json()
+    assert body["latest_price"] == "1.80"
+    assert body["price_updated_at"].startswith("2026-10-18T16:00:00")   # last_seen
+    assert body["price_history"][0]["scraped_at"].startswith("2026-10-18T10:00:00")
 
 
 def test_identical_timestamps_broken_by_id(db_client):

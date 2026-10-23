@@ -5,6 +5,7 @@ Tesco requests and no real Postgres.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 
 import pytest
@@ -215,3 +216,45 @@ def test_concurrent_create_recovers_via_requery(session, monkeypatch):
     assert session.scalar(select(func.count(Product.id))) == 1   # no duplicate
     assert (summary.created, summary.matched, summary.persisted) == (0, 1, 1)
     assert session.scalar(select(func.count(Price.id))) == 1     # price kept
+
+
+# --------------------------------------------------------------------------- #
+# Idempotent ingestion — unchanged prices are re-confirmed, not duplicated
+# --------------------------------------------------------------------------- #
+def test_unchanged_price_is_idempotent(session):
+    store = _store(session)
+    s1 = persist(session, store, [_item(ext="800", price="2.75")])
+    s2 = persist(session, store, [_item(ext="800", price="2.75")])  # rerun, same price
+    assert session.scalar(select(func.count(Product.id))) == 1
+    assert session.scalar(select(func.count(Price.id))) == 1        # NOT duplicated
+    assert (s1.persisted, s1.unchanged) == (1, 0)
+    assert (s2.persisted, s2.unchanged) == (0, 1)
+
+
+def test_price_change_creates_new_observation(session):
+    store = _store(session)
+    persist(session, store, [_item(ext="801", price="2.75")])
+    persist(session, store, [_item(ext="801", price="2.80")])      # genuine change
+    persist(session, store, [_item(ext="801", price="2.75")])      # changed back
+    assert session.scalar(select(func.count(Price.id))) == 3       # all changes kept
+
+
+def test_unchanged_price_bumps_last_seen_at(session):
+    store = _store(session)
+    prod = Product(store_id=store.id, external_id="802", name="Milk",
+                   url="https://www.tesco.com/shop/en-GB/products/802")
+    session.add(prod)
+    session.flush()
+    # Naive datetime: SQLite's now() (used by persist) returns naive values, so
+    # the baseline must be naive too for an apples-to-apples comparison. On
+    # Postgres both sides are tz-aware; the ordering assertion holds either way.
+    old = datetime(2026, 1, 1)
+    session.add(Price(product_id=prod.id, price=Decimal("2.75"), currency="GBP",
+                      in_stock=True, scraped_at=old, last_seen_at=old))
+    session.commit()
+
+    persist(session, store, [_item(ext="802", price="2.75")])
+    rows = session.scalars(select(Price)).all()
+    assert len(rows) == 1                       # no new row
+    assert rows[0].last_seen_at > old           # re-confirmed
+    assert rows[0].scraped_at == old            # original change time preserved

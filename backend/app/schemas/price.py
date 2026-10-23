@@ -16,4 +16,6 @@ class PriceRead(BaseModel):
     currency: str
     unit_price: str | None = None
     in_stock: bool
+    # When this price was first observed, and most recently re-confirmed (UTC).
     scraped_at: datetime
+    last_seen_at: datetime | None = None

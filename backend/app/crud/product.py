@@ -128,7 +128,9 @@ def to_read(product: Product, latest: Price | None) -> ProductRead:
         store=product.store,
         latest_price=latest.price if latest else None,
         currency=latest.currency if latest else None,
-        price_updated_at=latest.scraped_at if latest else None,
+        # "Last observed" = when the current price was last confirmed, which for
+        # an unchanged price is more recent than when it first changed.
+        price_updated_at=latest.last_seen_at if latest else None,
     )
 
 
@@ -148,6 +150,6 @@ def to_detail(product: Product, history: list[Price]) -> ProductDetail:
         store=product.store,
         latest_price=latest.price if latest else None,
         currency=latest.currency if latest else None,
-        price_updated_at=latest.scraped_at if latest else None,
+        price_updated_at=latest.last_seen_at if latest else None,
         price_history=history,
     )

@@ -67,8 +67,11 @@ python -m run --headful --categories milk bread eggs cheese chicken --max-pages 
 
 A helper wraps this: `scrapers/scrape_tesco.ps1`.
 
-Each run inserts fresh `prices` rows (time-series), so re-running builds price
-history. Products are de-duplicated by store-native `external_id`.
+Ingestion is **idempotent**: a run inserts a new `prices` row only when the
+price has *changed* since the last observation; an unchanged price is
+re-confirmed by bumping `last_seen_at` instead of stacking duplicate rows. So
+re-running builds a clean price-change history without inflating the table.
+Products are de-duplicated by store-native `external_id` (see Data model below).
 
 > The Docker `scraper` service (`docker compose run --rm scraper`) still runs and
 > demonstrates the architecture, but Akamai blocks it (headless, no real Chrome).
@@ -101,11 +104,53 @@ npm run dev
 
 | Method | Path              | Description |
 |--------|-------------------|-------------|
-| GET    | `/health`         | Liveness check |
-| GET    | `/products`       | Paginated product list (`page`, `page_size`, `category`) |
-| GET    | `/products/{id}`  | Product detail + latest price + price history |
+| GET    | `/health`         | Liveness check (also pings the DB) |
+| GET    | `/products`       | Paginated product list (`page`, `page_size`, `category`); each item carries `latest_price` + `price_updated_at` |
+| GET    | `/products/{id}`  | Product detail + latest price + bounded price history (`history_limit`, default 90) |
 | GET    | `/search`         | Search products (`q`, `page`, `page_size`) |
-| GET    | `/prices`         | Price records (`product_id`) |
+| GET    | `/prices`         | Price records (`product_id`, `limit`) |
+
+All list/detail responses are Pydantic-validated; the latest valid price is
+selected **database-side** (window query, no full-history load, no N+1).
+
+---
+
+## Data model & data integrity
+
+The schema separates the three concerns a comparison platform needs. (A
+*canonical product* layer that links listings across retailers is intentionally
+**deferred** to the comparison phase — see `docs/ARCHITECTURE.md`.)
+
+| Table | Role | Key points |
+|-------|------|------------|
+| `stores` | **Retailer** identity | unique `slug` |
+| `products` | **Retailer listing** (one store's representation) | `store_id`, `external_id`, `url`, name/brand/weight/category |
+| `prices` | **Price observations** (time-series) | `price` `Numeric(10,2)`, `currency`, `in_stock`, `scraped_at`, `last_seen_at` |
+
+Guarantees:
+- **Monetary** values use `Numeric(10,2)`; currency is explicit on every observation.
+- **Identity / no duplicates:** `UNIQUE(store_id, url)` and a **partial unique
+  index** `UNIQUE(store_id, external_id) WHERE external_id IS NOT NULL`. The
+  scraper matches on `external_id` first (store-scoped), then URL, and handles
+  concurrent-insert conflicts via a savepoint + re-query (no duplicate rows).
+- **History preserved:** observations are append-only; `scraped_at` is when a
+  price first appeared, `last_seen_at` when it was most recently re-confirmed.
+  "Current price" = newest by `(scraped_at DESC, id DESC)`; freshness uses
+  `last_seen_at`. Invalid/failed extractions store **no** observation.
+- **Timestamps** are stored in UTC (`timestamptz`).
+- **Indexes:** `(product_id, scraped_at, id)` for per-product latest/history,
+  `scraped_at` for the global `/prices` feed, plus name/brand/category for search.
+
+### Migrations
+
+Alembic, reproducible from an empty database (`alembic upgrade head`):
+
+| Revision | Purpose |
+|----------|---------|
+| `0001_initial` | stores / products / prices + base indexes |
+| `0002_price_index` | composite `(product_id, scraped_at, id)` index |
+| `0003_product_identity` | de-dupe + partial unique index on `(store_id, external_id)` |
+| `0004_price_last_seen` | add `last_seen_at` (idempotent ingestion), backfilled from `scraped_at` |
 
 ---
 
