@@ -15,13 +15,16 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Numeric,
     String,
     UniqueConstraint,
     create_engine,
     func,
     select,
+    text,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -52,7 +55,18 @@ class Store(Base):
 
 class Product(Base):
     __tablename__ = "products"
-    __table_args__ = (UniqueConstraint("store_id", "url", name="uq_product_store_url"),)
+    __table_args__ = (
+        UniqueConstraint("store_id", "url", name="uq_product_store_url"),
+        # Preferred identity: one row per (store, external_id) when known.
+        # Mirrors backend/app/models/product.py and migration 0003.
+        Index(
+            "uq_products_store_external",
+            "store_id",
+            "external_id",
+            unique=True,
+            postgresql_where=text("external_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"))
@@ -144,62 +158,111 @@ def is_valid_price(price: Decimal | None) -> bool:
     return price is not None and price > 0
 
 
+def normalize_url(url: str | None) -> str | None:
+    """Deliberate, conservative URL normalisation for fallback matching.
+
+    Trims surrounding whitespace and a single trailing slash so that
+    ``.../products/123`` and ``.../products/123/`` are treated as one listing.
+    We intentionally do NOT touch scheme/host/query — over-normalising risks
+    merging genuinely distinct listings. The retailer ``external_id`` remains
+    the preferred identity; URL is only the fallback.
+    """
+    if not url:
+        return url
+    u = url.strip()
+    if len(u) > 1 and u.endswith("/"):
+        u = u[:-1]
+    return u
+
+
+def _find_existing_product(
+    db: Session, store: Store, item: ScrapedProduct, url: str | None
+) -> Product | None:
+    """Locate an existing product by retailer external_id first, then URL.
+
+    Both lookups are scoped to ``store_id`` so identical external IDs or URLs
+    from different retailers can never collide.
+    """
+    product = None
+    if item.external_id:
+        product = db.scalar(
+            select(Product).where(
+                Product.store_id == store.id,
+                Product.external_id == item.external_id,
+            )
+        )
+    if product is None and url:
+        product = db.scalar(
+            select(Product).where(Product.store_id == store.id, Product.url == url)
+        )
+    return product
+
+
+def _refresh_metadata(product: Product, item: ScrapedProduct, url: str | None) -> None:
+    product.name = item.name or product.name
+    product.brand = item.brand or product.brand
+    product.weight = item.weight or product.weight
+    product.category = item.category or product.category
+    product.image_url = item.image_url or product.image_url
+    product.url = url or product.url
+
+
 def persist(db: Session, store: Store, items: list[ScrapedProduct]) -> PersistSummary:
     """Upsert products and append a fresh price observation for each valid one.
 
     Products are matched on the store-native ``external_id`` first (stable
-    across URL format changes), then on URL. Every scrape appends a new price
-    row — history is never overwritten. A product with no valid price is still
-    upserted (metadata), but no price observation is created.
+    across URL format changes), then on normalised URL — always scoped to the
+    store. Every scrape appends a new price row; history is never overwritten.
+
+    Concurrency: creation goes through a SAVEPOINT. If a competing scraper
+    inserts the same identity first, the unique constraint raises
+    ``IntegrityError``; the savepoint is rolled back (the outer transaction and
+    session stay usable), and we re-query and reuse the winning row so the price
+    observation attaches to the correct product and no duplicate is created.
 
     Logs one diagnostic line per product and returns a :class:`PersistSummary`.
-    Extraction failures (no valid price) are logged as skips; a database error
-    during commit is logged distinctly and re-raised.
     """
     summary = PersistSummary(attempted=len(items))
     for item in items:
-        product = None
-        if item.external_id:
-            product = db.scalar(
-                select(Product).where(
-                    Product.store_id == store.id,
-                    Product.external_id == item.external_id,
-                )
-            )
-        if product is None:
-            product = db.scalar(
-                select(Product).where(
-                    Product.store_id == store.id, Product.url == item.url
-                )
-            )
+        url = normalize_url(item.url)
+        ref = item.external_id or url
+        product = _find_existing_product(db, store, item, url)
 
         if product is None:
-            product = Product(
-                store_id=store.id,
-                external_id=item.external_id,
-                name=item.name,
-                brand=item.brand,
-                weight=item.weight,
-                category=item.category,
-                image_url=item.image_url,
-                url=item.url,
-            )
-            db.add(product)
-            db.flush()
-            summary.created += 1
-            disposition = "created"
+            try:
+                with db.begin_nested():  # SAVEPOINT
+                    product = Product(
+                        store_id=store.id,
+                        external_id=item.external_id,
+                        name=item.name,
+                        brand=item.brand,
+                        weight=item.weight,
+                        category=item.category,
+                        image_url=item.image_url,
+                        url=url,
+                    )
+                    db.add(product)
+                    db.flush()
+                summary.created += 1
+                disposition = "created"
+            except IntegrityError:
+                # A concurrent insert won; reuse the existing row.
+                product = _find_existing_product(db, store, item, url)
+                if product is None:
+                    summary.skipped += 1
+                    print(
+                        f"[persist] {store.slug} {ref} integrity conflict with no "
+                        f"matching row -> skipped"
+                    )
+                    continue
+                _refresh_metadata(product, item, url)
+                summary.matched += 1
+                disposition = "matched (after conflict)"
         else:
-            # Refresh mutable metadata that may have changed.
-            product.name = item.name or product.name
-            product.brand = item.brand or product.brand
-            product.weight = item.weight or product.weight
-            product.category = item.category or product.category
-            product.image_url = item.image_url or product.image_url
-            product.url = item.url or product.url
+            _refresh_metadata(product, item, url)
             summary.matched += 1
             disposition = "matched"
 
-        ref = item.external_id or item.url
         if is_valid_price(item.price):
             db.add(
                 Price(

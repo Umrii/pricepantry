@@ -53,11 +53,40 @@ def test_extract_price_ignores_unrelated_currency():
 
 
 @pytest.mark.parametrize(
+    "text, expected",
+    [
+        # Standard price shown first, Clubcard promo after -> keep the standard.
+        ("£2.75 Clubcard Price £2.00", Decimal("2.75")),
+        # Clubcard promo shown first -> still must resolve to the standard price.
+        ("Clubcard Price £2.00 £2.75", Decimal("2.75")),
+    ],
+)
+def test_extract_price_prefers_standard_over_clubcard(text, expected):
+    assert extract_price(text) == expected
+
+
+@pytest.mark.parametrize(
     "text",
-    ["", "   ", "Price unavailable", "Out of stock", "£", "no price here"],
+    ["", "   ", "Price unavailable", "Out of stock", "£", "no price here",
+     "£abc", "£ .", "price: TBC"],
 )
 def test_extract_price_missing_or_invalid(text):
     assert extract_price(text) is None
+
+
+def test_parse_handles_data_testid_structure():
+    # Tesco has shipped tiles under data-testid rather than the list-item class;
+    # the parser's selector fallbacks must still find the product and price.
+    html = """
+    <div data-testid="product-tile">
+      <a href="/shop/en-GB/products/111111"><span>Test Semi Skimmed 1L</span></a>
+      <p>£1.20</p><p>£1.20/litre</p>
+    </div>
+    """
+    p = _parse_one(html)
+    assert p.external_id == "111111"
+    assert p.price == Decimal("1.20")
+    assert p.unit_price == "£1.20/litre"
 
 
 # --------------------------------------------------------------------------- #

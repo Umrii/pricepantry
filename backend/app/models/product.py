@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, String, UniqueConstraint
+from sqlalchemy import ForeignKey, Index, String, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
@@ -18,6 +18,16 @@ class Product(Base, TimestampMixin):
     __table_args__ = (
         # A given URL uniquely identifies a listing within a store.
         UniqueConstraint("store_id", "url", name="uq_product_store_url"),
+        # The retailer's own product id is the preferred identity: enforce one
+        # row per (store, external_id) when the external_id is known. Partial so
+        # that rows without an external_id (URL-only) are unconstrained here.
+        Index(
+            "uq_products_store_external",
+            "store_id",
+            "external_id",
+            unique=True,
+            postgresql_where=text("external_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
